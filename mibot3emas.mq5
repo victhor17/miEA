@@ -1,10 +1,9 @@
 //+------------------------------------------------------------------+
-//|                                            TuEstrategiaCompleta.mq5 |
-//|                                  Generado según reglas del usuario |
-//|                                            Versión final corregida |
+//|                                            TuEstrategiaFinal.mq5   |
+//|                                            Versión 3.0 - Corregida |
 //+------------------------------------------------------------------+
 #property copyright "Tu EA Personalizado"
-#property version "2.00"
+#property version "3.00"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -12,11 +11,11 @@
 #include <Trade\AccountInfo.mqh>
 
 // --- Entradas del usuario ---
-input double InpRiskPercent = 1.0;      // % riesgo por operación (sobre saldo real)
-input int InpStopLossPips = 30;         // Stop Loss en pips (1 pip = 10 puntos)
+input double InpRiskPercent = 1.0;      // % riesgo por operación
+input int InpStopLossPips = 30;         // Stop Loss en pips
 input double InpMaxDrawdownDaily = 4.0; // Drawdown diario máximo (%)
-input int InpMaxPositions = 4;          // Máximo de posiciones abiertas totales
-input int InpMagicNumber = 20250405;    // Magic Number para identificar órdenes del EA
+input int InpMaxPositions = 4;          // Máximo de posiciones abiertas
+input int InpMagicNumber = 20250405;    // Magic Number
 
 // --- Parámetros de las EMAs ---
 input int InpEma1Period = 15;
@@ -24,7 +23,7 @@ input int InpEma2Period = 20;
 input int InpEma3Period = 50;
 
 // --- Gestión de trailing dinámico ---
-input int InpPipsToTrailingTP = 20; // Cuando el precio está a X pips del TP, se mueve SL/TP
+input int InpPipsToTrailingTP = 20;
 
 // --- Variables globales ---
 CTrade trade;
@@ -43,9 +42,8 @@ bool drawdownExceeded = false;
 int consecutiveLosses = 0;
 bool specialTradeActive = false;
 ulong specialTradeTicket = 0;
-bool waitingForSpecialTradeResult = false;
 
-// Variables para reentrada tras SL sin cruce
+// Variables para reentrada tras SL
 struct SLReentryInfo
 {
   bool pendingReentry;
@@ -55,51 +53,44 @@ struct SLReentryInfo
 };
 SLReentryInfo slReentry = {false, 0, 0.0, 0};
 
-// Variables para control de último cruce utilizado
+// Variables para control de último cruce de EMA1/EMA2
 struct LastCruceInfo
 {
-  int direction;    // 1 compra, -1 venta, 0 ninguno
-  datetime barTime; // Tiempo de la vela donde ocurrió el cruce
+  int direction; // 1 compra, -1 venta, 0 ninguno
+  datetime barTime;
+  bool used; // Si ya se usó para abrir operación
 };
-LastCruceInfo lastCruce = {0, 0};
+LastCruceInfo lastCruceEMA1 = {0, 0, false};
 
-// Variables para cooldown después de TP
-struct TPCooldown
+// Variables para bloqueo después de TP
+struct TPBlockInfo
 {
   bool active;
-  int direction;
-  datetime blockUntilBarTime; // Bloquear hasta esta vela
+  int blockedDirection; // Dirección bloqueada (1 compra, -1 venta)
+  datetime blockStartTime;
 };
-TPCooldown tpCooldown = {false, 0, 0};
+TPBlockInfo tpBlock = {false, 0, 0};
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-  // Crear handles de las EMAs
   ema1Handle = iMA(_Symbol, PERIOD_H1, InpEma1Period, 0, MODE_EMA, PRICE_CLOSE);
   ema2Handle = iMA(_Symbol, PERIOD_H1, InpEma2Period, 0, MODE_EMA, PRICE_CLOSE);
   ema3Handle = iMA(_Symbol, PERIOD_H1, InpEma3Period, 0, MODE_EMA, PRICE_CLOSE);
 
   if (ema1Handle == INVALID_HANDLE || ema2Handle == INVALID_HANDLE || ema3Handle == INVALID_HANDLE)
-  {
-    Print("Error creando handles de EMAs");
     return (INIT_FAILED);
-  }
 
-  // Establecer como series arrays para acceso por tiempo
   ArraySetAsSeries(ema1, true);
   ArraySetAsSeries(ema2, true);
   ArraySetAsSeries(ema3, true);
 
-  // Inicializar control diario
   ResetDailyStats();
-
   trade.SetExpertMagicNumber(InpMagicNumber);
 
   Print("EA inicializado correctamente");
-  Print("Parámetros: SL=", InpStopLossPips, " pips, Riesgo=", InpRiskPercent, "%, MaxPos=", InpMaxPositions);
   return (INIT_SUCCEEDED);
 }
 
@@ -111,7 +102,6 @@ void OnDeinit(const int reason)
   IndicatorRelease(ema1Handle);
   IndicatorRelease(ema2Handle);
   IndicatorRelease(ema3Handle);
-  Print("EA finalizado. Razón: ", reason);
 }
 
 //+------------------------------------------------------------------+
@@ -119,36 +109,27 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
-  // Actualizar trailing dinámico en cada tick
   UpdateTrailing();
-
-  // Verificar si alguna operación se cerró (para reentrada o pérdidas consecutivas)
   CheckClosedPositions();
 
-  // Solo operar al cierre de vela en H1 para nuevas entradas
   if (!IsNewBar())
     return;
 
-  // Actualizar control de drawdown diario
   UpdateDailyDrawdown();
   if (drawdownExceeded)
-  {
-    Print("Drawdown diario máximo alcanzado (", InpMaxDrawdownDaily, "%). Nuevas entradas bloqueadas hasta mañana.");
     return;
-  }
 
-  // Obtener valores actuales de las EMAs
   if (!GetEmaValues())
     return;
 
-  // Determinar tendencia mayor (EMA2 vs EMA3)
+  // Detectar tendencia mayor
   bool tendenciaAlcista = (ema2[0] > ema3[0]);
   bool tendenciaBajista = (ema2[0] < ema3[0]);
 
-  // Detectar cambio de tendencia (cierre de todas las operaciones y apertura contraria)
-  CheckTrendChangeAndCloseAll(tendenciaAlcista, tendenciaBajista);
+  // VERIFICAR CRUCE DE EMA2/EMA3 (CAMBIO DE TENDENCIA) - PRIORIDAD MÁXIMA
+  CheckTrendChange(tendenciaAlcista, tendenciaBajista);
 
-  // Verificar reentrada pendiente por SL sin cruce
+  // Verificar reentrada pendiente por SL
   CheckPendingSLReentry(tendenciaAlcista, tendenciaBajista);
 
   // Verificar si podemos abrir nuevas operaciones
@@ -160,12 +141,11 @@ void OnTick()
   if (direction == 0)
     return;
 
-  // Abrir operación
   OpenTrade(direction);
 }
 
 //+------------------------------------------------------------------+
-//| Verifica si es una nueva vela en H1                             |
+//| Verifica nueva vela                                             |
 //+------------------------------------------------------------------+
 bool IsNewBar()
 {
@@ -179,25 +159,16 @@ bool IsNewBar()
 }
 
 //+------------------------------------------------------------------+
-//| Obtiene los valores de las 3 EMAs                               |
+//| Obtiene valores de EMAs                                         |
 //+------------------------------------------------------------------+
 bool GetEmaValues()
 {
   if (CopyBuffer(ema1Handle, 0, 0, 2, ema1) < 2)
-  {
-    Print("Error copiando EMA1");
     return false;
-  }
   if (CopyBuffer(ema2Handle, 0, 0, 2, ema2) < 2)
-  {
-    Print("Error copiando EMA2");
     return false;
-  }
   if (CopyBuffer(ema3Handle, 0, 0, 2, ema3) < 2)
-  {
-    Print("Error copiando EMA3");
     return false;
-  }
   return true;
 }
 
@@ -209,11 +180,10 @@ void ResetDailyStats()
   dailyStartBalance = accountInfo.Balance();
   dailyEquityPeak = accountInfo.Equity();
   drawdownExceeded = false;
-  Print("Estadísticas diarias reseteadas. Saldo inicial: ", dailyStartBalance);
 }
 
 //+------------------------------------------------------------------+
-//| Actualiza el drawdown diario                                    |
+//| Actualiza drawdown diario                                       |
 //+------------------------------------------------------------------+
 void UpdateDailyDrawdown()
 {
@@ -222,13 +192,9 @@ void UpdateDailyDrawdown()
     dailyEquityPeak = currentEquity;
 
   double drawdownPercent = (dailyEquityPeak - currentEquity) / dailyEquityPeak * 100.0;
-  if (drawdownPercent >= InpMaxDrawdownDaily && !drawdownExceeded)
-  {
+  if (drawdownPercent >= InpMaxDrawdownDaily)
     drawdownExceeded = true;
-    Print("ALERTA: Drawdown diario alcanzado: ", drawdownPercent, "%");
-  }
 
-  // Si es un nuevo día, resetear
   static datetime lastDay = 0;
   datetime currentDay = iTime(_Symbol, PERIOD_D1, 0);
   if (currentDay != lastDay)
@@ -239,13 +205,11 @@ void UpdateDailyDrawdown()
 }
 
 //+------------------------------------------------------------------+
-//| Determina la dirección de las operaciones abiertas del EA       |
+//| Retorna dirección de las operaciones abiertas                   |
 //+------------------------------------------------------------------+
 int GetCurrentDirection()
 {
-  bool hasBuy = false;
-  bool hasSell = false;
-
+  bool hasBuy = false, hasSell = false;
   for (int i = 0; i < PositionsTotal(); i++)
   {
     if (positionInfo.SelectByIndex(i) && positionInfo.Magic() == InpMagicNumber)
@@ -256,7 +220,6 @@ int GetCurrentDirection()
         hasSell = true;
     }
   }
-
   if (hasBuy && !hasSell)
     return 1;
   if (hasSell && !hasBuy)
@@ -265,88 +228,76 @@ int GetCurrentDirection()
 }
 
 //+------------------------------------------------------------------+
-//| Cambio de tendencia: SOLO si es contrario a las operaciones     |
+//| VERIFICA CRUCE DE EMA2/EMA3 Y CIERRA OPERACIONES CONTRARIAS     |
 //+------------------------------------------------------------------+
-void CheckTrendChangeAndCloseAll(bool alcista, bool bajista)
+void CheckTrendChange(bool alcista, bool bajista)
 {
   static bool lastAlcista = false;
   static bool lastBajista = false;
 
-  // Detectar si hubo un cruce de EMA2/EMA3 en esta vela
-  bool cruceAlcista = (alcista && !lastAlcista && lastBajista);
-  bool cruceBajista = (bajista && !lastBajista && lastAlcista);
+  // Detectar cruce en la vela actual
+  bool nuevoCruceAlcista = (alcista && !lastAlcista);
+  bool nuevoCruceBajista = (bajista && !lastBajista);
 
-  if (!cruceAlcista && !cruceBajista)
-  {
-    lastAlcista = alcista;
-    lastBajista = bajista;
-    return;
-  }
+  // También detectar cuando se invierte la tendencia (cruce)
+  bool inversionAlcista = (alcista && lastBajista);
+  bool inversionBajista = (bajista && lastAlcista);
 
-  // Obtener dirección actual de las operaciones abiertas
-  int currentDirection = GetCurrentDirection();
+  bool hayCambio = inversionAlcista || inversionBajista;
 
-  // Determinar si el cruce es CONTRARIO a las operaciones abiertas
-  bool cruceContrario = false;
+  if (hayCambio)
+  {
+    int direccionActual = GetCurrentDirection();
 
-  if (cruceAlcista && currentDirection == -1)
-  {
-    cruceContrario = true;
-    Print("Cruce alcista de EMA2/EMA3 detectado. Es CONTRARIO a las ventas abiertas.");
-  }
-  else if (cruceBajista && currentDirection == 1)
-  {
-    cruceContrario = true;
-    Print("Cruce bajista de EMA2/EMA3 detectado. Es CONTRARIO a las compras abiertas.");
-  }
-  else if (currentDirection == 0)
-  {
-    cruceContrario = true;
-    Print("Cruce de EMA2/EMA3 detectado sin operaciones abiertas.");
-  }
-  else
-  {
-    Print("Cruce de EMA2/EMA3 a favor de las operaciones abiertas. No se cierra nada.");
-  }
+    // Determinar si el cambio es CONTRARIO a las operaciones abiertas
+    bool cerrarOperaciones = false;
 
-  if (cruceContrario)
-  {
-    // Cerrar todas las posiciones del EA
-    for (int i = PositionsTotal() - 1; i >= 0; i--)
+    if (inversionAlcista && direccionActual == -1) // Cruce a alcista con ventas abiertas
     {
-      if (positionInfo.SelectByIndex(i))
+      cerrarOperaciones = true;
+      Print("CAMBIO DE TENDENCIA ALCISTA - Cerrando ventas");
+    }
+    else if (inversionBajista && direccionActual == 1) // Cruce a bajista con compras abiertas
+    {
+      cerrarOperaciones = true;
+      Print("CAMBIO DE TENDENCIA BAJISTA - Cerrando compras");
+    }
+    else if (direccionActual == 0) // Sin operaciones abiertas
+    {
+      cerrarOperaciones = false;
+    }
+
+    if (cerrarOperaciones)
+    {
+      // Cerrar todas las posiciones
+      for (int i = PositionsTotal() - 1; i >= 0; i--)
       {
-        if (positionInfo.Magic() == InpMagicNumber)
+        if (positionInfo.SelectByIndex(i) && positionInfo.Magic() == InpMagicNumber)
         {
           trade.PositionClose(positionInfo.Ticket());
-          Print("Cerrando posición: ", positionInfo.Ticket());
+          Print("Cerrando posición por cambio de tendencia: ", positionInfo.Ticket());
         }
       }
-    }
 
-    // Resetear modo especial, reentradas pendientes y último cruce
-    specialTradeActive = false;
-    specialTradeTicket = 0;
-    waitingForSpecialTradeResult = false;
-    slReentry.pendingReentry = false;
-    tpCooldown.active = false;
-    lastCruce.direction = 0;
-    lastCruce.barTime = 0;
+      // Resetear estados
+      specialTradeActive = false;
+      specialTradeTicket = 0;
+      slReentry.pendingReentry = false;
+      lastCruceEMA1.direction = 0;
+      lastCruceEMA1.used = false;
+      tpBlock.active = false;
 
-    // Abrir nueva operación a favor de la NUEVA tendencia
-    if (cruceAlcista)
-    {
-      Print("Abriendo nueva compra por cambio de tendencia alcista");
-      OpenTrade(1);
-      lastCruce.direction = 1;
-      lastCruce.barTime = iTime(_Symbol, PERIOD_H1, 0);
-    }
-    else if (cruceBajista)
-    {
-      Print("Abriendo nueva venta por cambio de tendencia bajista");
-      OpenTrade(-1);
-      lastCruce.direction = -1;
-      lastCruce.barTime = iTime(_Symbol, PERIOD_H1, 0);
+      // Abrir nueva operación a favor de la nueva tendencia
+      if (inversionAlcista)
+      {
+        Print("Abriendo nueva compra por cambio de tendencia");
+        OpenTrade(1);
+      }
+      else if (inversionBajista)
+      {
+        Print("Abriendo nueva venta por cambio de tendencia");
+        OpenTrade(-1);
+      }
     }
   }
 
@@ -355,25 +306,20 @@ void CheckTrendChangeAndCloseAll(bool alcista, bool bajista)
 }
 
 //+------------------------------------------------------------------+
-//| Verifica condiciones para abrir nueva operación                 |
+//| Verifica límites para abrir operación                           |
 //+------------------------------------------------------------------+
 bool CanOpenNewTrade()
 {
-  // Límite de posiciones totales
   int totalPositions = 0;
   for (int i = 0; i < PositionsTotal(); i++)
   {
-    if (positionInfo.SelectByIndex(i))
-      if (positionInfo.Magic() == InpMagicNumber)
-        totalPositions++;
+    if (positionInfo.SelectByIndex(i) && positionInfo.Magic() == InpMagicNumber)
+      totalPositions++;
   }
   if (totalPositions >= InpMaxPositions)
-  {
-    // Print("Límite de posiciones alcanzado: ", totalPositions, "/", InpMaxPositions);
     return false;
-  }
 
-  // No operaciones contrarias abiertas
+  // Verificar operaciones contrarias
   bool hasBuy = false, hasSell = false;
   for (int i = 0; i < PositionsTotal(); i++)
   {
@@ -386,10 +332,7 @@ bool CanOpenNewTrade()
     }
   }
   if (hasBuy && hasSell)
-  {
-    Print("ERROR: Operaciones contrarias abiertas simultáneamente");
     return false;
-  }
 
   return true;
 }
@@ -399,125 +342,99 @@ bool CanOpenNewTrade()
 //+------------------------------------------------------------------+
 int GetTradeDirection(bool tendenciaAlcista, bool tendenciaBajista)
 {
-  // Detectar cruce de EMA1 y EMA2 en la vela actual
+  // Detectar cruce de EMA1 y EMA2
   bool cruceEma1Ema2Up = (ema1[0] > ema2[0] && ema1[1] <= ema2[1]);
   bool cruceEma1Ema2Down = (ema1[0] < ema2[0] && ema1[1] >= ema2[1]);
 
-  // Si no hay cruce en esta vela, salir
   if (!cruceEma1Ema2Up && !cruceEma1Ema2Down)
+  {
+    // No hay cruce, resetear bandera de usado
+    lastCruceEMA1.used = false;
     return 0;
+  }
 
-  // Determinar la dirección del cruce actual
-  int currentCruceDirection = 0;
-  if (cruceEma1Ema2Up)
-    currentCruceDirection = 1;
-  if (cruceEma1Ema2Down)
-    currentCruceDirection = -1;
-
-  // Obtener tiempo de la vela actual
+  int currentDirection = cruceEma1Ema2Up ? 1 : -1;
   datetime currentBarTime = iTime(_Symbol, PERIOD_H1, 0);
 
-  // ========== VERIFICAR COOLDOWN POR TP ==========
-  if (tpCooldown.active)
+  // ========== BLOQUEO POR TP ==========
+  if (tpBlock.active && currentDirection == tpBlock.blockedDirection)
   {
-    if (currentBarTime > tpCooldown.blockUntilBarTime)
-    {
-      tpCooldown.active = false;
-      Print("Cooldown por TP finalizado.");
-    }
-    else
-    {
-      bool cruceContrario = false;
-      if (tpCooldown.direction == 1 && cruceEma1Ema2Down)
-        cruceContrario = true;
-      if (tpCooldown.direction == -1 && cruceEma1Ema2Up)
-        cruceContrario = true;
-
-      if (!cruceContrario)
-      {
-        Print("Bloqueado por TP: dirección ", (tpCooldown.direction == 1 ? "COMPRA" : "VENTA"));
-        return 0;
-      }
-      else
-      {
-        Print("Cruce contrario después de TP. Permitiendo entrada.");
-        tpCooldown.active = false;
-      }
-    }
+    Print("BLOQUEO POR TP: No se permiten ", (currentDirection == 1 ? "COMPRAS" : "VENTAS"),
+          " después de TP. Esperando cruce contrario.");
+    return 0;
   }
 
   // ========== VERIFICAR POSICIONES ABIERTAS ==========
-  bool hayPosicionesAbiertas = false;
-  bool hayCompraAbierta = false;
-  bool hayVentaAbierta = false;
-  int totalPosicionesEA = 0;
+  bool hayPosiciones = false;
+  bool hayCompra = false, hayVenta = false;
+  int totalPos = 0;
 
   for (int i = 0; i < PositionsTotal(); i++)
   {
     if (positionInfo.SelectByIndex(i) && positionInfo.Magic() == InpMagicNumber)
     {
-      hayPosicionesAbiertas = true;
-      totalPosicionesEA++;
+      hayPosiciones = true;
+      totalPos++;
       if (positionInfo.PositionType() == POSITION_TYPE_BUY)
-        hayCompraAbierta = true;
+        hayCompra = true;
       if (positionInfo.PositionType() == POSITION_TYPE_SELL)
-        hayVentaAbierta = true;
+        hayVenta = true;
     }
   }
 
-  // ========== DETERMINAR SI SE PERMITE LA OPERACIÓN ==========
-  bool permitirOperacion = false;
+  // ========== LÓGICA DE PERMISO ==========
+  bool permitir = false;
 
-  // Caso 1: No hay posiciones abiertas
-  if (!hayPosicionesAbiertas)
+  // Caso 1: Sin posiciones abiertas
+  if (!hayPosiciones)
   {
-    if (lastCruce.direction != currentCruceDirection || currentBarTime > lastCruce.barTime + 3600)
+    // Verificar que sea un cruce nuevo (no el mismo de la vela anterior sin usar)
+    if (lastCruceEMA1.direction != currentDirection || !lastCruceEMA1.used)
     {
-      permitirOperacion = true;
-      Print("Sin posiciones, nuevo cruce ", (currentCruceDirection == 1 ? "alcista" : "bajista"));
+      permitir = true;
+      Print("Nuevo cruce sin posiciones: ", (currentDirection == 1 ? "COMPRA" : "VENTA"));
     }
   }
-  // Caso 2: Compras abiertas y tendencia alcista
-  else if (tendenciaAlcista && hayCompraAbierta && !hayVentaAbierta)
+  // Caso 2: Compras abiertas y tendencia alcista - permitir NUEVOS cruces alcistas
+  else if (tendenciaAlcista && hayCompra && !hayVenta)
   {
-    if (currentCruceDirection == 1)
+    if (currentDirection == 1)
     {
-      permitirOperacion = true;
-      Print("Nuevo cruce alcista a favor de la tendencia. Posiciones abiertas: ", totalPosicionesEA);
+      permitir = true;
+      Print("Nuevo cruce alcista a favor. Posiciones: ", totalPos);
     }
   }
-  // Caso 3: Ventas abiertas y tendencia bajista
-  else if (tendenciaBajista && hayVentaAbierta && !hayCompraAbierta)
+  // Caso 3: Ventas abiertas y tendencia bajista - permitir NUEVOS cruces bajistas
+  else if (tendenciaBajista && hayVenta && !hayCompra)
   {
-    if (currentCruceDirection == -1)
+    if (currentDirection == -1)
     {
-      permitirOperacion = true;
-      Print("Nuevo cruce bajista a favor de la tendencia. Posiciones abiertas: ", totalPosicionesEA);
-    }
-  }
-
-  // Evitar doble operación en la misma vela
-  if (permitirOperacion && hayPosicionesAbiertas)
-  {
-    if (lastCruce.direction == currentCruceDirection && currentBarTime == lastCruce.barTime)
-    {
-      permitirOperacion = false;
-      Print("Mismo cruce en la misma vela, ignorando.");
+      permitir = true;
+      Print("Nuevo cruce bajista a favor. Posiciones: ", totalPos);
     }
   }
 
-  if (permitirOperacion)
+  // Evitar el mismo cruce en la misma vela
+  if (permitir && lastCruceEMA1.direction == currentDirection &&
+      lastCruceEMA1.barTime == currentBarTime && lastCruceEMA1.used)
   {
-    lastCruce.direction = currentCruceDirection;
-    lastCruce.barTime = currentBarTime;
-    return currentCruceDirection;
+    permitir = false;
+    Print("Mismo cruce en misma vela, ignorando");
+  }
+
+  if (permitir)
+  {
+    lastCruceEMA1.direction = currentDirection;
+    lastCruceEMA1.barTime = currentBarTime;
+    lastCruceEMA1.used = true;
+    return currentDirection;
   }
 
   return 0;
 }
 
 //+------------------------------------------------------------------+
-//| Abre una operación                                               |
+//| Abre operación                                                   |
 //+------------------------------------------------------------------+
 void OpenTrade(int direction)
 {
@@ -529,12 +446,11 @@ void OpenTrade(int direction)
   double slPrice = (direction == 1) ? price - slPips * 10 * point : price + slPips * 10 * point;
   double tpPrice = (direction == 1) ? price + tpPips * 10 * point : price - tpPips * 10 * point;
 
-  // Calcular volumen según riesgo 1% sobre saldo real
+  // Calcular lote por riesgo
   double balance = accountInfo.Balance();
   double riskMoney = balance * (InpRiskPercent / 100.0);
   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-  double slInPoints = slPips * 10;
-  double lot = riskMoney / (slInPoints * tickValue);
+  double lot = riskMoney / (slPips * 10 * tickValue);
   lot = NormalizeDouble(lot, 2);
 
   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
@@ -556,16 +472,9 @@ void OpenTrade(int direction)
 
   if (trade.ResultRetcode() == TRADE_RETCODE_DONE)
   {
-    Print("Operación abierta: ", comment, " Lote: ", lot, " Dirección: ", (direction == 1 ? "COMPRA" : "VENTA"));
+    Print("OPERACIÓN ABIERTA: ", comment, " Lote:", lot, " ", (direction == 1 ? "COMPRA" : "VENTA"));
     if (specialTradeActive)
-    {
       specialTradeTicket = trade.ResultOrder();
-      waitingForSpecialTradeResult = true;
-    }
-  }
-  else
-  {
-    Print("Error al abrir operación: ", trade.ResultRetcodeDescription());
   }
 }
 
@@ -595,10 +504,10 @@ void CheckClosedPositions()
     if (dealEntry != DEAL_ENTRY_OUT)
       continue;
 
-    static ulong lastProcessedDeal = 0;
-    if (dealTicket == lastProcessedDeal)
+    static ulong lastProcessed = 0;
+    if (dealTicket == lastProcessed)
       continue;
-    lastProcessedDeal = dealTicket;
+    lastProcessed = dealTicket;
 
     long reason = HistoryDealGetInteger(dealTicket, DEAL_REASON);
     double profit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
@@ -608,51 +517,23 @@ void CheckClosedPositions()
     long posType = HistoryDealGetInteger(dealTicket, DEAL_TYPE);
     int closedDirection = (posType == DEAL_TYPE_BUY) ? 1 : -1;
 
-    // Detectar cierre por TP
+    // ========== CIERRE POR TP - ACTIVAR BLOQUEO ==========
     if (reason == DEAL_REASON_TP)
     {
-      datetime currentBarTime = iTime(_Symbol, PERIOD_H1, 0);
-      tpCooldown.active = true;
-      tpCooldown.direction = closedDirection;
-      tpCooldown.blockUntilBarTime = currentBarTime + 3600;
-      Print("TP alcanzado en ", (closedDirection == 1 ? "COMPRA" : "VENTA"), ". Cooldown activado.");
+      tpBlock.active = true;
+      tpBlock.blockedDirection = closedDirection;
+      tpBlock.blockStartTime = TimeCurrent();
+
+      // Resetear el último cruce para que no se reutilice
+      lastCruceEMA1.direction = 0;
+      lastCruceEMA1.used = false;
+
+      Print("TP ALCANZADO en ", (closedDirection == 1 ? "COMPRA" : "VENTA"),
+            ". BLOQUEADAS nuevas ", (closedDirection == 1 ? "COMPRAS" : "VENTAS"),
+            " hasta cruce contrario.");
     }
 
-    // Manejo de pérdidas consecutivas
-    if (profit <= 0)
-    {
-      consecutiveLosses++;
-      Print("Pérdida. Consecutivas: ", consecutiveLosses);
-
-      if (specialTradeActive && positionTicket == specialTradeTicket)
-      {
-        specialTradeActive = true;
-        waitingForSpecialTradeResult = false;
-        specialTradeTicket = 0;
-      }
-      else
-      {
-        if (consecutiveLosses >= 4 && !specialTradeActive)
-        {
-          specialTradeActive = true;
-          waitingForSpecialTradeResult = false;
-          Print("Activando modo 1:1 por 4 pérdidas consecutivas");
-        }
-      }
-    }
-    else
-    {
-      consecutiveLosses = 0;
-      if (specialTradeActive && positionTicket == specialTradeTicket)
-      {
-        specialTradeActive = false;
-        waitingForSpecialTradeResult = false;
-        specialTradeTicket = 0;
-        Print("Modo 1:1 desactivado por ganancia.");
-      }
-    }
-
-    // Manejo de reentrada tras SL
+    // ========== CIERRE POR SL - REENTRADA PENDIENTE ==========
     if (reason == DEAL_REASON_SL)
     {
       if (!slReentry.pendingReentry)
@@ -661,11 +542,40 @@ void CheckClosedPositions()
         slReentry.direction = closedDirection;
         slReentry.slPrice = closePrice;
         slReentry.lossTime = TimeCurrent();
-        Print("SL detectado. Reentrada pendiente en ", (closedDirection == 1 ? "COMPRA" : "VENTA"));
+        Print("SL DETECTADO. Reentrada pendiente en ", (closedDirection == 1 ? "COMPRA" : "VENTA"));
       }
-      // Resetear lastCruce para permitir nuevos cruces después de SL
-      lastCruce.direction = 0;
-      lastCruce.barTime = 0;
+
+      // Resetear lastCruce para permitir nuevos cruces
+      lastCruceEMA1.direction = 0;
+      lastCruceEMA1.used = false;
+    }
+
+    // ========== PÉRDIDAS CONSECUTIVAS ==========
+    if (profit <= 0)
+    {
+      consecutiveLosses++;
+      Print("Pérdida. Consecutivas: ", consecutiveLosses);
+
+      if (specialTradeActive && positionTicket == specialTradeTicket)
+      {
+        specialTradeActive = true;
+        specialTradeTicket = 0;
+      }
+      else if (consecutiveLosses >= 4 && !specialTradeActive)
+      {
+        specialTradeActive = true;
+        Print("ACTIVANDO MODO 1:1 por 4 pérdidas consecutivas");
+      }
+    }
+    else
+    {
+      consecutiveLosses = 0;
+      if (specialTradeActive && positionTicket == specialTradeTicket)
+      {
+        specialTradeActive = false;
+        specialTradeTicket = 0;
+        Print("MODO 1:1 DESACTIVADO por ganancia");
+      }
     }
   }
 }
@@ -678,58 +588,54 @@ void CheckPendingSLReentry(bool tendenciaAlcista, bool tendenciaBajista)
   if (!slReentry.pendingReentry)
     return;
 
+  // Verificar si ha ocurrido cruce contrario
   bool cruceEma1Ema2Up = (ema1[0] > ema2[0] && ema1[1] <= ema2[1]);
   bool cruceEma1Ema2Down = (ema1[0] < ema2[0] && ema1[1] >= ema2[1]);
 
-  bool mismoCruceNoOcurrido = false;
+  bool cruceContrarioOcurrido = false;
 
-  if (slReentry.direction == 1)
-  {
-    if (!cruceEma1Ema2Down)
-      mismoCruceNoOcurrido = true;
-  }
-  else
-  {
-    if (!cruceEma1Ema2Up)
-      mismoCruceNoOcurrido = true;
-  }
+  if (slReentry.direction == 1 && cruceEma1Ema2Down)
+    cruceContrarioOcurrido = true;
+  if (slReentry.direction == -1 && cruceEma1Ema2Up)
+    cruceContrarioOcurrido = true;
 
-  if (mismoCruceNoOcurrido)
-  {
-    if (CanOpenNewTrade())
-    {
-      bool hayCompraAbierta = false, hayVentaAbierta = false;
-      for (int i = 0; i < PositionsTotal(); i++)
-      {
-        if (positionInfo.SelectByIndex(i) && positionInfo.Magic() == InpMagicNumber)
-        {
-          if (positionInfo.PositionType() == POSITION_TYPE_BUY)
-            hayCompraAbierta = true;
-          if (positionInfo.PositionType() == POSITION_TYPE_SELL)
-            hayVentaAbierta = true;
-        }
-      }
-
-      bool reentryAllowed = false;
-      if (!hayCompraAbierta && !hayVentaAbierta)
-        reentryAllowed = true;
-      else if (tendenciaAlcista && hayCompraAbierta && slReentry.direction == 1)
-        reentryAllowed = true;
-      else if (tendenciaBajista && hayVentaAbierta && slReentry.direction == -1)
-        reentryAllowed = true;
-
-      if (reentryAllowed)
-      {
-        Print("Ejecutando reentrada por SL");
-        OpenTrade(slReentry.direction);
-        slReentry.pendingReentry = false;
-      }
-    }
-  }
-  else
+  if (cruceContrarioOcurrido)
   {
     slReentry.pendingReentry = false;
     Print("Reentrada cancelada: ocurrió cruce contrario");
+    return;
+  }
+
+  // Verificar condiciones para reentrar
+  if (CanOpenNewTrade())
+  {
+    bool hayCompra = false, hayVenta = false;
+    for (int i = 0; i < PositionsTotal(); i++)
+    {
+      if (positionInfo.SelectByIndex(i) && positionInfo.Magic() == InpMagicNumber)
+      {
+        if (positionInfo.PositionType() == POSITION_TYPE_BUY)
+          hayCompra = true;
+        if (positionInfo.PositionType() == POSITION_TYPE_SELL)
+          hayVenta = true;
+      }
+    }
+
+    bool reentryAllowed = false;
+
+    if (!hayCompra && !hayVenta)
+      reentryAllowed = true;
+    else if (tendenciaAlcista && hayCompra && slReentry.direction == 1)
+      reentryAllowed = true;
+    else if (tendenciaBajista && hayVenta && slReentry.direction == -1)
+      reentryAllowed = true;
+
+    if (reentryAllowed)
+    {
+      Print("EJECUTANDO REENTRADA por SL");
+      OpenTrade(slReentry.direction);
+      slReentry.pendingReentry = false;
+    }
   }
 }
 
@@ -776,12 +682,11 @@ void UpdateTrailing()
       if (distanceToNewTP <= InpPipsToTrailingTP * 10 * point)
       {
         double newSLPrice = (direction == 1) ? openPrice + newSLPips * 10 * point : openPrice - newSLPips * 10 * point;
-        double newTPPrice = currentTPPrice;
 
         if ((direction == 1 && newSLPrice > sl) || (direction == -1 && newSLPrice < sl) || sl == 0)
         {
-          trade.PositionModify(positionInfo.Ticket(), newSLPrice, newTPPrice);
-          Print("Trailing: nivel ", level + 1, ":1, SL: ", newSLPips, " pips, TP: ", newTPPips, " pips");
+          trade.PositionModify(positionInfo.Ticket(), newSLPrice, currentTPPrice);
+          Print("Trailing: nivel ", level + 1, ":1");
         }
       }
     }
