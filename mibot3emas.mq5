@@ -17,8 +17,12 @@ input double InpMaxDrawdownDaily = 4.0; // Drawdown diario máximo (%)
 input int InpMaxPositions = 4;          // Máximo de posiciones abiertas
 input int InpMagicNumber = 20250405;    // Magic Number
 // --- Gestión de trailing dinámico ---
-input bool InpUseTrailing = true;   // Activar/Desactivar trailing dinámico
-input int InpPipsToTrailingTP = 20; // Distancia al TP para activar trailing (solo si está activado)
+input bool InpUseTrailing = true;    // Activar/Desactivar trailing dinámico
+input int InpPipsToTrailingTP = 20;  // Distancia al TP para activar trailing (solo si está activado)
+input int InpTrailingStartPips = 15; // Pips ganados para activar trailing (0 = desactivado)
+// Agrega esta variable global en la sección de variables
+bool pendingSpecialTrade = false;        // Para abrir operación 1:1 en la siguiente vela
+datetime specialTradeActivationTime = 0; // Momento en que se activó el modo 1:1
 
 // --- Gestión de riesgo y ratios ---
 input double InpInitialRatio = 3.0; // Ratio beneficio inicial (ej: 3 = 1:3, 4 = 1:4, etc.)
@@ -124,6 +128,7 @@ void OnTick()
 {
   UpdateTrailing();
   CheckClosedPositions();
+  CheckPendingSpecialTrade(); // ← AÑADE ESTA LÍNEA
 
   if (!IsNewBar())
     return;
@@ -694,7 +699,9 @@ void ReentradaPost11()
 {
   Print("🔄 REENTRADA POST-1:1 - Buscando operación a favor de la tendencia");
 
-  // Obtener tendencia actual de EMA2/EMA3
+  // Esta función se llama DESPUÉS de desactivar specialTradeActive
+  // Así que las nuevas operaciones usarán el ratio normal
+
   if (!GetEmaValues())
   {
     Print("⚠️ Reentrada post-1:1 cancelada: No se pudieron obtener valores de EMAs");
@@ -705,39 +712,24 @@ void ReentradaPost11()
   bool tendenciaBajista = (ema2[0] < ema3[0]);
 
   int direccionNueva = 0;
-  string razon = "";
-
   if (tendenciaAlcista)
-  {
     direccionNueva = 1;
-    razon = "Tendencia actual ALCISTA";
-  }
   else if (tendenciaBajista)
-  {
     direccionNueva = -1;
-    razon = "Tendencia actual BAJISTA";
-  }
   else
   {
     Print("⚠️ Reentrada post-1:1 cancelada: No hay tendencia clara");
     return;
   }
 
-  // Verificar límite de posiciones
   if (!CanOpenNewTrade())
   {
     Print("⚠️ Reentrada post-1:1 cancelada: Límite de posiciones alcanzado");
     return;
   }
 
-  Print("   Razón: ", razon);
-  Print("   Dirección: ", (direccionNueva == 1 ? "COMPRA" : "VENTA"));
-
-  // Temporalmente desactivar specialTradeActive para que no sea 1:1
-  bool tempSpecial = specialTradeActive;
-  specialTradeActive = false;
+  // Ya no hay specialTradeActive, se abre con ratio normal
   OpenTrade(direccionNueva);
-  specialTradeActive = tempSpecial;
 }
 
 //+------------------------------------------------------------------+
@@ -795,18 +787,25 @@ void CheckClosedPositions()
         Print("📉 PÉRDIDA VÁLIDA por SL (", (closedDirection == 1 ? "COMPRA" : "VENTA"),
               "). Consecutivas: ", consecutiveLosses);
 
+        // CORRECCIÓN: Si era la operación especial, desactivarla (pero mantener el modo)
         if (specialTradeActive && positionTicket == specialTradeTicket)
         {
-          specialTradeActive = true;
+          specialTradeActive = false; // ← CORREGIDO: antes estaba "true"
           specialTradeTicket = 0;
-        }
-        else if (consecutiveLosses >= 4 && !specialTradeActive)
-        {
-          specialTradeActive = true;
-          Print("⚠️ ACTIVANDO MODO 1:1 por 4 pérdidas consecutivas");
+          Print("   Operación especial cerrada con pérdida");
         }
 
-        // ========== REENTRADA SOLO PARA PÉRDIDAS VÁLIDAS ==========
+        // Activar nuevo modo 1:1 si llegamos a 4 pérdidas
+        if (consecutiveLosses >= 4 && !specialTradeActive && !pendingSpecialTrade)
+        {
+          specialTradeActive = true;
+          pendingSpecialTrade = true; // Marcar que debemos abrir en la siguiente vela
+          specialTradeActivationTime = TimeCurrent();
+          Print("⚠️ ACTIVANDO MODO 1:1 por 4 pérdidas consecutivas");
+          Print("   Se abrirá operación 1:1 en la siguiente vela");
+        }
+
+        // REENTRADA POR SL - AHORA SIEMPRE se ejecuta (incluso en modo 1:1)
         if (!slReentry.pendingReentry && slReentry.reentryCount < 3)
         {
           slReentry.pendingReentry = true;
@@ -814,7 +813,7 @@ void CheckClosedPositions()
           slReentry.slPrice = closePrice;
           slReentry.lossTime = TimeCurrent();
           slReentry.reentryCount++;
-          Print("🔄 SL DETECTADO (PÉRDIDA VÁLIDA). Reentrada pendiente en ",
+          Print("🔄 SL DETECTADO. Reentrada pendiente en ",
                 (closedDirection == 1 ? "COMPRA" : "VENTA"));
         }
       }
@@ -848,9 +847,6 @@ void CheckClosedPositions()
       lastCruceEMA1.direction = 0;
       lastCruceEMA1.used = false;
 
-      // Verificar si era una operación especial 1:1
-      bool eraOperacionEspecial = (specialTradeActive && positionTicket == specialTradeTicket);
-
       // Resetear contador de pérdidas
       if (consecutiveLosses > 0)
       {
@@ -858,15 +854,23 @@ void CheckClosedPositions()
       }
       consecutiveLosses = 0;
 
-      // Si era una operación especial 1:1, desactivar modo y abrir nueva operación
-      if (eraOperacionEspecial)
+      // Si era una operación especial 1:1, desactivar modo y abrir nueva
+      if (specialTradeActive && positionTicket == specialTradeTicket)
       {
         specialTradeActive = false;
         specialTradeTicket = 0;
+        pendingSpecialTrade = false; // Limpiar pendiente
         Print("MODO 1:1 DESACTIVADO por TP");
 
         // Abrir nueva operación a favor de la tendencia
         ReentradaPost11();
+      }
+      else if (specialTradeActive)
+      {
+        // Si el TP no era de la operación especial, igual desactivamos modo 1:1
+        specialTradeActive = false;
+        pendingSpecialTrade = false;
+        Print("MODO 1:1 DESACTIVADO - TP alcanzado en otra operación");
       }
 
       continue;
@@ -940,6 +944,60 @@ void CheckClosedPositions()
       continue;
     }
   }
+}
+
+void CheckPendingSpecialTrade()
+{
+  if (!pendingSpecialTrade)
+    return;
+
+  // Esperar a la siguiente vela (1 hora después de la activación)
+  if (TimeCurrent() - specialTradeActivationTime < 3600)
+  {
+    static datetime lastWaitLog = 0;
+    if (TimeCurrent() - lastWaitLog > 300) // Log cada 5 minutos
+    {
+      lastWaitLog = TimeCurrent();
+      Print("⏳ Modo 1:1 - Esperando siguiente vela para abrir operación");
+    }
+    return;
+  }
+
+  // Obtener valores de EMAs para conocer la tendencia
+  if (!GetEmaValues())
+  {
+    Print("⚠️ Modo 1:1 - No se pudieron obtener EMAs, reintentando...");
+    return;
+  }
+
+  bool tendenciaAlcista = (ema2[0] > ema3[0]);
+  bool tendenciaBajista = (ema2[0] < ema3[0]);
+
+  int direction = 0;
+  if (tendenciaAlcista)
+    direction = 1;
+  else if (tendenciaBajista)
+    direction = -1;
+  else
+  {
+    Print("⚠️ Modo 1:1 - Sin tendencia clara, esperando...");
+    return;
+  }
+
+  // Verificar si podemos abrir operación
+  if (!CanOpenNewTrade())
+  {
+    Print("⚠️ Modo 1:1 - Límite de posiciones alcanzado, esperando...");
+    return;
+  }
+
+  // Abrir la operación especial 1:1
+  Print("🚀 EJECUTANDO OPERACIÓN ESPECIAL 1:1");
+  Print("   Tendencia actual: ", (direction == 1 ? "ALCISTA" : "BAJISTA"));
+
+  // Temporalmente marcamos que estamos abriendo la especial
+  pendingSpecialTrade = false;
+  OpenTrade(direction); // Esta operación usará el ratio 1:1 por la variable specialTradeActive = true
 }
 
 //+------------------------------------------------------------------+
@@ -1074,13 +1132,18 @@ void CheckPendingSLReentry(bool tendenciaAlcista, bool tendenciaBajista)
     }
   }
 }
+
 //+------------------------------------------------------------------+
-//| Trailing dinámico (con ratio inicial personalizado)             |
+//| Trailing dinámico por niveles (VERSIÓN ORIGINAL CORREGIDA)       |
 //+------------------------------------------------------------------+
 void UpdateTrailing()
 {
   if (!InpUseTrailing)
     return;
+
+  double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+  double pipSize = 10 * point;
+  double slPips = InpStopLossPips;
 
   for (int i = 0; i < PositionsTotal(); i++)
   {
@@ -1088,6 +1151,8 @@ void UpdateTrailing()
       continue;
     if (positionInfo.Magic() != InpMagicNumber)
       continue;
+
+    // No aplicar trailing a operaciones especiales 1:1
     if (specialTradeActive && positionInfo.Ticket() == specialTradeTicket)
       continue;
 
@@ -1095,75 +1160,80 @@ void UpdateTrailing()
     double currentPrice = (positionInfo.PositionType() == POSITION_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
     double currentSL = positionInfo.StopLoss();
     double currentTP = positionInfo.TakeProfit();
-    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
 
     int direction = (positionInfo.PositionType() == POSITION_TYPE_BUY) ? 1 : -1;
 
-    double profitPips = (currentPrice - openPrice) / point / 10 * direction;
-    double originalSLPips = InpStopLossPips;
+    // Calcular ganancia actual en múltiplos del SL (ratio alcanzado)
+    double profitPips = (currentPrice - openPrice) / pipSize * direction;
+    int nivelAlcanzado = (int)MathFloor(profitPips / slPips);
 
-    // El nivel se calcula basado en el ratio inicial
-    // Ej: Si ratio inicial es 1:4, entonces 1:4 = nivel 4
-    int nivelAlcanzado = (int)MathFloor(profitPips / originalSLPips);
+    // Solo actuar si hemos alcanzado al menos nivel 2 (1:2)
+    if (nivelAlcanzado < 2)
+      continue;
 
-    // Activar trailing desde 1:2 (si el ratio inicial es menor, empezar desde ahí)
-    int nivelMinimoTrailing = 2;
-    if (InpInitialRatio > 2)
-      nivelMinimoTrailing = (int)InpInitialRatio;
+    // ========== CALCULAR NUEVO TP ==========
+    // Regla: TP nuevo = nivelAlcanzado + 2
+    // Ej: nivel 2 -> TP 4, nivel 3 -> TP 5, nivel 4 -> TP 6...
+    int nuevoNivelTP = nivelAlcanzado + 2;
+    if (nuevoNivelTP > 15)
+      nuevoNivelTP = 15;
 
-    if (nivelAlcanzado >= nivelMinimoTrailing)
+    double nuevoTPPips = slPips * nuevoNivelTP;
+    double nuevoTPPrice = (direction == 1) ? openPrice + nuevoTPPips * pipSize : openPrice - nuevoTPPips * pipSize;
+
+    // ========== CALCULAR NUEVO SL ==========
+    // Regla:
+    // - Nivel 2: SL no se mueve (sigue siendo el original)
+    // - Nivel 3: SL = BE (distancia 0 desde open)
+    // - Nivel 4: SL = 1:1 (distancia 1*SL desde open)
+    // - Nivel 5: SL = 1:2 (distancia 2*SL desde open)
+    // - General: SL = (nivelAlcanzado - 3) * SL
+
+    double nuevoSLPrice = currentSL; // Por defecto, mantener SL actual
+    double distanciaSLPips = -1;     // -1 indica "sin cambio"
+
+    if (nivelAlcanzado >= 3)
     {
-      int nuevoNivelTP = nivelAlcanzado + 2;
-      if (nuevoNivelTP > 15)
-        nuevoNivelTP = 15;
+      distanciaSLPips = (nivelAlcanzado - 3) * slPips;
+      if (distanciaSLPips < 0)
+        distanciaSLPips = 0;
 
-      double nuevoTPPips = originalSLPips * nuevoNivelTP;
+      if (direction == 1) // Compra
+        nuevoSLPrice = openPrice + distanciaSLPips * pipSize;
+      else // Venta
+        nuevoSLPrice = openPrice - distanciaSLPips * pipSize;
+    }
 
-      double distanciaSLPips = -originalSLPips;
+    // ========== VERIFICAR SI ES NECESARIO MODIFICAR ==========
+    bool necesitaModificar = false;
 
-      if (nivelAlcanzado >= 3)
+    // Verificar TP
+    if (direction == 1 && nuevoTPPrice > currentTP)
+      necesitaModificar = true;
+    if (direction == -1 && nuevoTPPrice < currentTP)
+      necesitaModificar = true;
+
+    // Verificar SL (solo si estamos en nivel >=3)
+    if (nivelAlcanzado >= 3)
+    {
+      if (direction == 1 && nuevoSLPrice > currentSL)
+        necesitaModificar = true;
+      if (direction == -1 && nuevoSLPrice < currentSL)
+        necesitaModificar = true;
+    }
+
+    // ========== EJECUTAR MODIFICACIÓN ==========
+    if (necesitaModificar)
+    {
+      if (trade.PositionModify(positionInfo.Ticket(), nuevoSLPrice, nuevoTPPrice))
       {
-        distanciaSLPips = (nivelAlcanzado - 3) * originalSLPips;
-      }
-
-      double nuevoTPPrice = (direction == 1) ? openPrice + nuevoTPPips * 10 * point : openPrice - nuevoTPPips * 10 * point;
-      double nuevoSLPrice = (direction == 1) ? openPrice + distanciaSLPips * 10 * point : openPrice - distanciaSLPips * 10 * point;
-
-      bool necesitaModificar = false;
-
-      if (direction == 1)
-      {
-        if (nuevoTPPrice > currentTP)
-          necesitaModificar = true;
-        if (nuevoSLPrice > currentSL)
-          necesitaModificar = true;
-      }
-      else
-      {
-        if (nuevoTPPrice < currentTP)
-          necesitaModificar = true;
-        if (nuevoSLPrice < currentSL)
-          necesitaModificar = true;
-      }
-
-      if (necesitaModificar)
-      {
-        trade.PositionModify(positionInfo.Ticket(), nuevoSLPrice, nuevoTPPrice);
-
-        string slTexto = "";
-        if (distanciaSLPips == 0)
-          slTexto = "BE";
-        else if (distanciaSLPips == -originalSLPips)
-          slTexto = "-" + DoubleToString(originalSLPips, 0) + " pips (sin cambios)";
-        else if (distanciaSLPips > 0)
-          slTexto = "+" + DoubleToString(distanciaSLPips, 0) + " pips";
-        else
-          slTexto = DoubleToString(distanciaSLPips, 0) + " pips";
+        // Log del cambio
+        string slTexto = (nivelAlcanzado < 3) ? "sin cambios" : (distanciaSLPips == 0 ? "BE" : DoubleToString(distanciaSLPips, 0) + " pips");
 
         Print("📈 TRAILING ACTIVADO - Nivel alcanzado: ", nivelAlcanzado, ":1");
-        Print("   Profit actual: ", DoubleToString(profitPips, 1), " pips");
-        Print("   Nuevo SL: ", slTexto);
+        Print("   Ganancia actual: ", DoubleToString(profitPips, 1), " pips");
         Print("   Nuevo TP: ", nuevoNivelTP, ":1 (", nuevoTPPips, " pips)");
+        Print("   Nuevo SL: ", slTexto);
       }
     }
   }
