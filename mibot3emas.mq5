@@ -31,6 +31,7 @@ input double InpInitialRatio = 3.0; // Ratio beneficio inicial (ej: 3 = 1:3, 4 =
 input int InpEma1Period = 15;
 input int InpEma2Period = 20;
 input int InpEma3Period = 50;
+input bool useReentryAfterSL = true;
 
 // --- Variables globales ---
 CTrade trade;
@@ -147,8 +148,9 @@ void OnTick()
   // VERIFICAR CRUCE DE EMA2/EMA3 (CAMBIO DE TENDENCIA) - PRIORIDAD MÁXIMA
   CheckTrendChange(tendenciaAlcista, tendenciaBajista);
 
-  // Verificar reentrada pendiente por SL
-  CheckPendingSLReentry(tendenciaAlcista, tendenciaBajista);
+  if (useReentryAfterSL)
+    // Verificar reentrada pendiente por SL
+    CheckPendingSLReentry(tendenciaAlcista, tendenciaBajista);
 
   // Verificar si podemos abrir nuevas operaciones
   if (!CanOpenNewTrade())
@@ -1179,7 +1181,9 @@ void UpdateTrailing()
       nuevoNivelTP = 15;
 
     double nuevoTPPips = slPips * nuevoNivelTP;
+    Print("Nuevo TP en pips: ", nuevoTPPips);
     double nuevoTPPrice = (direction == 1) ? openPrice + nuevoTPPips * pipSize : openPrice - nuevoTPPips * pipSize;
+    Print("Nuevo precio de TP: ", nuevoTPPrice);
 
     // ========== CALCULAR NUEVO SL ==========
     // Regla:
@@ -1203,6 +1207,8 @@ void UpdateTrailing()
       else // Venta
         nuevoSLPrice = openPrice - distanciaSLPips * pipSize;
     }
+
+    Print("Nuevo SL en precio: ", nuevoSLPrice);
 
     // ========== VERIFICAR SI ES NECESARIO MODIFICAR ==========
     bool necesitaModificar = false;
