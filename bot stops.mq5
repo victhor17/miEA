@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, Your Name"
 #property link      "https://www.yoursite"
-#property version   "1.94"
+#property version   "1.95"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -36,6 +36,13 @@ input int    InpDrawdownMode            = 0;       // Modo: 0=%, 1=dinero
 input int    InpDailyProfitMode         = 0;       // Modo profit: 0=%, 1=dinero
 input double InpDailyProfitPercent      = 0.0;     // Profit objetivo diario en % (ej: 2.5)
 input double InpDailyProfitMoney        = 0.0;     // Profit objetivo diario en dinero (ej: 200)
+
+//--- parámetros de entrada (sesiones de mercado)
+input bool InpTradeTokyo   = false;    // Operar en sesión Tokio (00:00-08:00 UTC)
+input bool InpTradeLondon  = true;     // Operar en sesión Londres (08:00-16:00 UTC)
+input bool InpTradeNewYork = true;     // Operar en sesión Nueva York (13:00-21:00 UTC)
+input bool InpTradeAsia    = false;    // Operar en sesión Asia (21:00-05:00 UTC)
+input int  InpTimeZoneOffset = 0;      // Desfase horario del servidor (UTC+/-)
 
 //--- parámetros de entrada (panel visual)
 input color InpColorTitle    = clrWhite;
@@ -172,7 +179,6 @@ void UpdateCommissionsAccumulator()
 bool HasExpansionOrdersOrPositions(string side)
 {
    string prefix = (side == "Buy") ? "ExpBuy" : "ExpSell";
-   // Verificar órdenes pendientes
    int totalOrders = OrdersTotal();
    for(int i = 0; i < totalOrders; i++)
    {
@@ -188,7 +194,6 @@ bool HasExpansionOrdersOrPositions(string side)
          }
       }
    }
-   // Verificar posiciones abiertas
    int totalPos = PositionsTotal();
    for(int i = 0; i < totalPos; i++)
    {
@@ -204,6 +209,36 @@ bool HasExpansionOrdersOrPositions(string side)
          }
       }
    }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Verifica si está permitido operar en la sesión actual            |
+//+------------------------------------------------------------------+
+bool IsTradingAllowed()
+{
+   // Si todas las sesiones están desactivadas, asumimos que se permite operar siempre
+   if(!InpTradeTokyo && !InpTradeLondon && !InpTradeNewYork && !InpTradeAsia)
+      return true;
+   
+   datetime now = TimeCurrent();
+   MqlDateTime dt;
+   TimeToStruct(now, dt);
+   
+   int hourUTC = dt.hour - InpTimeZoneOffset;
+   if(hourUTC < 0) hourUTC += 24;
+   if(hourUTC >= 24) hourUTC -= 24;
+   
+   bool isTokyo = (hourUTC >= 0 && hourUTC < 8);
+   bool isLondon = (hourUTC >= 8 && hourUTC < 16);
+   bool isNewYork = (hourUTC >= 13 && hourUTC < 21);
+   bool isAsia = (hourUTC >= 21 || hourUTC < 5);
+   
+   if(isTokyo && InpTradeTokyo) return true;
+   if(isLondon && InpTradeLondon) return true;
+   if(isNewYork && InpTradeNewYork) return true;
+   if(isAsia && InpTradeAsia) return true;
+   
    return false;
 }
 
@@ -245,9 +280,19 @@ int OnInit()
       Print("Cierre de posiciones contrarias desactivado (InpCloseOppositeCount = 0)");
    
    if(InpCooldownHours > 0)
-      Print("Cooldown activado: ", InpCooldownHours, " horas tras cerrar todo sin órdenes pendientes o con expansiones en ambos lados.");
+      Print("Cooldown activado: ", InpCooldownHours, " horas.");
    else
       Print("Cooldown desactivado (InpCooldownHours = 0)");
+   
+   // Mostrar sesiones activas
+   string sessions = "Sesiones activas: ";
+   if(InpTradeTokyo) sessions += "Tokio ";
+   if(InpTradeLondon) sessions += "Londres ";
+   if(InpTradeNewYork) sessions += "Nueva York ";
+   if(InpTradeAsia) sessions += "Asia ";
+   if(sessions == "Sesiones activas: ")
+      sessions += "Todas (ninguna seleccionada)";
+   Print(sessions, "| Offset UTC: ", InpTimeZoneOffset);
    
    // Configuración del drawdown diario
    if(InpDrawdownMode == 0 && InpDailyMaxDrawdownPercent > 0.0)
@@ -294,7 +339,7 @@ int OnInit()
    int panelWidth = MathMax(InpPanelWidth, minWidth);
    int panelX = chartWidth - panelWidth - InpPanelMarginRight;
    int panelY = 30;
-   int panelHeight = 290; // Aumentado para nueva línea (7 filas)
+   int panelHeight = 290;
    
    CreatePanel(panelX, panelY, panelWidth, panelHeight);
    panelCreated = true;
@@ -356,51 +401,65 @@ void OnTick()
       }
    }
    
+   // ---- Verificar sesión de mercado ----
+   bool tradingAllowed = IsTradingAllowed();
+   
    if(!gridPlaced)
    {
-      if(CountPendingOrders() > 0)
-         CancelAllPendingOrders();
-      
-      if(PositionsTotal() > 0)
+      // Solo intentar colocar rejilla si está permitido operar
+      if(tradingAllowed)
       {
-         bool hasMyPositions = false;
-         for(int i = 0; i < PositionsTotal(); i++)
+         if(CountPendingOrders() > 0)
+            CancelAllPendingOrders();
+         
+         if(PositionsTotal() > 0)
          {
-            ulong ticket = PositionGetTicket(i);
-            if(PositionSelectByTicket(ticket))
+            bool hasMyPositions = false;
+            for(int i = 0; i < PositionsTotal(); i++)
             {
-               if(IsMySymbol(PositionGetString(POSITION_SYMBOL)) && 
-                  PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+               ulong ticket = PositionGetTicket(i);
+               if(PositionSelectByTicket(ticket))
                {
-                  hasMyPositions = true;
-                  break;
+                  if(IsMySymbol(PositionGetString(POSITION_SYMBOL)) && 
+                     PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+                  {
+                     hasMyPositions = true;
+                     break;
+                  }
                }
             }
+            if(hasMyPositions)
+            {
+               Print("Cerrando posiciones residuales del EA antes de colocar rejilla inicial.");
+               CloseAllPositions();
+               totalCommissions = 0.0;
+               closedLossAccumulator = 0.0;
+            }
          }
-         if(hasMyPositions)
+         
+         MqlTick tick;
+         if(SymbolInfoTick(_Symbol, tick) && tick.ask > 0 && tick.bid > 0)
          {
-            Print("Cerrando posiciones residuales del EA antes de colocar rejilla inicial.");
-            CloseAllPositions();
-            totalCommissions = 0.0;
-            closedLossAccumulator = 0.0;
+            if(PlaceGrid())
+            {
+               gridPlaced = true;
+               Print("Rejilla inicial colocada correctamente.");
+            }
          }
       }
-      
-      MqlTick tick;
-      if(SymbolInfoTick(_Symbol, tick) && tick.ask > 0 && tick.bid > 0)
-      {
-         if(PlaceGrid())
-         {
-            gridPlaced = true;
-            Print("Rejilla inicial colocada correctamente.");
-         }
-      }
+      // Siempre actualizar el panel (aunque no se pueda operar)
+      UpdatePanel();
       return;
    }
    
+   // ---- Gestión normal (siempre se actualiza el panel) ----
    UpdateCommissionsAccumulator();
    ManagePositions();
-   CheckAndAddOrders();
+   
+   // Solo añadir órdenes si está permitido operar
+   if(tradingAllowed)
+      CheckAndAddOrders();
+   
    UpdateMaxDrawdown();
    UpdatePanel();
 }
@@ -859,6 +918,10 @@ void CheckAndAddOrders()
    if(dailyDrawdownReached || dailyProfitReached || cooldownActive)
       return;
    
+   // Si no está permitido operar, no añadir órdenes
+   if(!IsTradingAllowed())
+      return;
+   
    MqlTick tick;
    if(!SymbolInfoTick(_Symbol, tick) || tick.ask <= 0 || tick.bid <= 0)
       return;
@@ -1154,6 +1217,9 @@ void PlaceDoubleGrid()
    if(dailyDrawdownReached || dailyProfitReached || cooldownActive)
       return;
    
+   if(!IsTradingAllowed())
+      return;
+   
    MqlTick tick;
    if(!SymbolInfoTick(_Symbol, tick) || tick.ask <= 0 || tick.bid <= 0)
       return;
@@ -1224,6 +1290,9 @@ bool PlaceGrid()
    if(dailyDrawdownReached || dailyProfitReached || cooldownActive)
       return false;
    
+   if(!IsTradingAllowed())
+      return false;
+   
    CancelAllPendingOrders();
    
    MqlTick tick;
@@ -1287,6 +1356,9 @@ bool PlaceGrid()
 bool SendStopOrder(ENUM_ORDER_TYPE type, double price, double volume, string comment)
 {
    if(dailyDrawdownReached || dailyProfitReached || cooldownActive)
+      return false;
+   
+   if(!IsTradingAllowed())
       return false;
    
    trade.SetExpertMagicNumber(InpMagicNumber);
@@ -1385,14 +1457,14 @@ void UpdateMaxDrawdown()
 }
 
 //+------------------------------------------------------------------+
-//| FUNCIONES DEL PANEL VISUAL                                        |
+//| FUNCIONES DEL PANEL VISUAL (sin cambios, solo se actualiza)     |
 //+------------------------------------------------------------------+
 void CreatePanel(int panelX, int panelY, int panelWidth, int panelHeight)
 {
    ObjectsDeleteAll(0, "GridPanel_");
    
    int rowHeight = MathMax(InpFontSizeLabels + 8, 28);
-   int totalRows = 7; // Ahora 7 filas (título + 6 info)
+   int totalRows = 7;
    int calculatedHeight = (totalRows * rowHeight) + 45;
    panelHeight = MathMax(panelHeight, calculatedHeight);
    
@@ -1413,7 +1485,7 @@ void CreatePanel(int panelX, int panelY, int panelWidth, int panelHeight)
    int labelX = panelX + 10;
    int valueX = labelX + InpPanelSeparation;
    
-   CreateLabel("GridPanel_Title", labelX, yPos, "=== EA Grid Trading v1.94 ===", InpColorTitle, InpFontSizeTitle);
+   CreateLabel("GridPanel_Title", labelX, yPos, "=== EA Grid Trading v1.95 ===", InpColorTitle, InpFontSizeTitle);
    yPos += rowHeight;
    CreateLabel("GridPanel_ProfitLabel", labelX, yPos, "Profit actual:", InpColorLabels, InpFontSizeLabels);
    CreateLabel("GridPanel_ProfitValue", valueX, yPos, "0.00", InpColorValues, InpFontSizeValues);
@@ -1430,12 +1502,10 @@ void CreatePanel(int panelX, int panelY, int panelWidth, int panelHeight)
    CreateLabel("GridPanel_DrawdownLabel", labelX, yPos, "Drawdown máx:", InpColorLabels, InpFontSizeLabels);
    CreateLabel("GridPanel_DrawdownValue", valueX, yPos, "0.00", InpColorValues, InpFontSizeValues);
    yPos += rowHeight;
-   // Nueva línea: Profit restante diario
    CreateLabel("GridPanel_ProfitDailyLabel", labelX, yPos, "Falta profit diario:", InpColorLabels, InpFontSizeLabels);
    CreateLabel("GridPanel_ProfitDailyValue", valueX, yPos, "---", InpColorValues, InpFontSizeValues);
    yPos += rowHeight + 5;
    
-   // Botón Trailing
    string btnName = "GridPanel_TrailingBtn";
    ObjectCreate(0, btnName, OBJ_BUTTON, 0, 0, 0);
    ObjectSetInteger(0, btnName, OBJPROP_XDISTANCE, labelX);
@@ -1509,7 +1579,7 @@ void UpdatePanel()
    else
       ObjectSetInteger(0, "GridPanel_DrawdownValue", OBJPROP_COLOR, InpColorValues);
    
-   // --- Profit restante diario ---
+   // Profit restante diario
    string dailyProfitText = "---";
    if(dailyProfitEnabled)
    {
@@ -1517,20 +1587,18 @@ void UpdatePanel()
       if(dailyStartEquity > 0)
       {
          if(dailyProfitReached)
-         {
             dailyProfitText = "Alcanzado";
-         }
          else
          {
             double currentProfit = equity - dailyStartEquity;
-            if(InpDailyProfitMode == 0) // Porcentaje
+            if(InpDailyProfitMode == 0)
             {
                double currentPercent = (currentProfit / dailyStartEquity) * 100.0;
                double remaining = dailyProfitTarget - currentPercent;
                if(remaining < 0) remaining = 0;
                dailyProfitText = DoubleToString(remaining, 2) + "%";
             }
-            else // Dinero
+            else
             {
                double remaining = dailyProfitTarget - currentProfit;
                if(remaining < 0) remaining = 0;
@@ -1544,7 +1612,6 @@ void UpdatePanel()
    else
       dailyProfitText = "Desactivado";
    ObjectSetString(0, "GridPanel_ProfitDailyValue", OBJPROP_TEXT, dailyProfitText);
-   // Color verde si está activo y no alcanzado, gris si desactivado
    if(dailyProfitEnabled && !dailyProfitReached && dailyStartEquity > 0)
       ObjectSetInteger(0, "GridPanel_ProfitDailyValue", OBJPROP_COLOR, InpColorValues);
    else if(dailyProfitReached)
@@ -1552,7 +1619,6 @@ void UpdatePanel()
    else
       ObjectSetInteger(0, "GridPanel_ProfitDailyValue", OBJPROP_COLOR, clrGray);
    
-   // Actualizar botón Trailing
    if(InpTrailingStopPoints > 0)
    {
       string btnName = "GridPanel_TrailingBtn";
