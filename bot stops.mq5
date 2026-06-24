@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, Your Name"
 #property link      "https://www.yoursite"
-#property version   "1.95"
+#property version   "1.98"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -26,6 +26,7 @@ input double InpLotIncrement          = 0.01;      // Incremento de lote por pas
 input int    InpLotStep               = 1;         // Cada cuántas rejillas se aplica el incremento
 input int    InpCloseOppositeCount    = 0;         // Nº de posiciones contrarias a cerrar por rejilla (0=desactivado)
 input double InpCooldownHours         = 2.0;       // Horas de espera tras cerrar todo sin órdenes pendientes o con expansiones en ambos lados
+input int    InpMaxTotalPositions     = 0;         // Máx. posiciones totales (0=desactivado)
 
 //--- parámetros de entrada (gestión diaria - drawdown)
 input double InpDailyMaxDrawdownPercent = 0.0;     // Drawdown máximo diario en % (ej: 4.5)
@@ -99,9 +100,16 @@ bool dailyProfitReached = false;
 double dailyProfitTarget = 0.0;
 bool dailyProfitEnabled = false;
 
+//--- contadores de límites diarios alcanzados
+int dailyProfitCount = 0;
+int dailyDrawdownCount = 0;
+
 //--- variables para cooldown
 bool cooldownActive = false;
 datetime cooldownEndTime = 0;
+
+//--- variable para profit de cierre por límite de posiciones
+double lastMaxPositionsProfit = 0.0;
 
 //--- Array de estados por rejilla
 GridState gridStates[];
@@ -217,7 +225,6 @@ bool HasExpansionOrdersOrPositions(string side)
 //+------------------------------------------------------------------+
 bool IsTradingAllowed()
 {
-   // Si todas las sesiones están desactivadas, asumimos que se permite operar siempre
    if(!InpTradeTokyo && !InpTradeLondon && !InpTradeNewYork && !InpTradeAsia)
       return true;
    
@@ -284,7 +291,11 @@ int OnInit()
    else
       Print("Cooldown desactivado (InpCooldownHours = 0)");
    
-   // Mostrar sesiones activas
+   if(InpMaxTotalPositions > 0)
+      Print("Límite máximo de posiciones totales: ", InpMaxTotalPositions);
+   else
+      Print("Límite de posiciones totales desactivado (InpMaxTotalPositions = 0)");
+   
    string sessions = "Sesiones activas: ";
    if(InpTradeTokyo) sessions += "Tokio ";
    if(InpTradeLondon) sessions += "Londres ";
@@ -339,7 +350,7 @@ int OnInit()
    int panelWidth = MathMax(InpPanelWidth, minWidth);
    int panelX = chartWidth - panelWidth - InpPanelMarginRight;
    int panelY = 30;
-   int panelHeight = 290;
+   int panelHeight = 355; // 9 filas
    
    CreatePanel(panelX, panelY, panelWidth, panelHeight);
    panelCreated = true;
@@ -351,10 +362,13 @@ int OnInit()
    dailyDrawdownReached = false;
    dailyStartEquity = 0.0;
    dailyProfitReached = false;
+   dailyProfitCount = 0;
+   dailyDrawdownCount = 0;
    totalCommissions = 0.0;
    closedLossAccumulator = 0.0;
    cooldownActive = false;
    cooldownEndTime = 0;
+   lastMaxPositionsProfit = 0.0;
    
    Print("EA iniciado. Esperando primer tick...");
    return(INIT_SUCCEEDED);
@@ -401,12 +415,10 @@ void OnTick()
       }
    }
    
-   // ---- Verificar sesión de mercado ----
    bool tradingAllowed = IsTradingAllowed();
    
    if(!gridPlaced)
    {
-      // Solo intentar colocar rejilla si está permitido operar
       if(tradingAllowed)
       {
          if(CountPendingOrders() > 0)
@@ -447,19 +459,14 @@ void OnTick()
             }
          }
       }
-      // Siempre actualizar el panel (aunque no se pueda operar)
       UpdatePanel();
       return;
    }
    
-   // ---- Gestión normal (siempre se actualiza el panel) ----
    UpdateCommissionsAccumulator();
    ManagePositions();
-   
-   // Solo añadir órdenes si está permitido operar
    if(tradingAllowed)
       CheckAndAddOrders();
-   
    UpdateMaxDrawdown();
    UpdatePanel();
 }
@@ -506,6 +513,7 @@ void CheckDailyControls()
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
    bool mustStop = false;
    
+   // Verificar Drawdown
    if(dailyDrawdownEnabled && !dailyDrawdownReached)
    {
       if(dailyMaxEquity == 0.0 || equity > dailyMaxEquity)
@@ -539,9 +547,11 @@ void CheckDailyControls()
       {
          dailyDrawdownReached = true;
          mustStop = true;
+         dailyDrawdownCount++;
       }
    }
    
+   // Verificar Profit
    if(dailyProfitEnabled && !dailyProfitReached)
    {
       double currentProfit = equity - dailyStartEquity;
@@ -571,9 +581,11 @@ void CheckDailyControls()
       {
          dailyProfitReached = true;
          mustStop = true;
+         dailyProfitCount++;
       }
    }
    
+   // Si se debe detener, cerrar todo
    if(mustStop)
    {
       Print("Cerrando todas las posiciones y cancelando órdenes por límite diario.");
@@ -589,7 +601,7 @@ void CheckDailyControls()
 }
 
 //+------------------------------------------------------------------+
-//| Gestiona posiciones (cierre por profit/trailing o cooldown)      |
+//| Gestiona posiciones (cierre por profit/trailing, cooldown, límite)|
 //+------------------------------------------------------------------+
 void ManagePositions()
 {
@@ -623,6 +635,23 @@ void ManagePositions()
       }
    }
    
+   // --- LÍMITE MÁXIMO DE POSICIONES ---
+   if(InpMaxTotalPositions > 0 && (buyCount + sellCount) >= InpMaxTotalPositions)
+   {
+      lastMaxPositionsProfit = totalProfit;
+      Print("Límite máximo de posiciones alcanzado (", buyCount+sellCount, "/", InpMaxTotalPositions, 
+            "). Cerrando todas las posiciones. Profit de cierre: ", DoubleToString(totalProfit, 2));
+      accumulatedProfit += totalProfit;
+      CancelAllPendingOrders();
+      CloseAllPositions();
+      closedLossAccumulator = 0.0;
+      totalCommissions = 0.0;
+      ResetAllGrids();
+      gridPlaced = false;
+      return;
+   }
+   
+   // Si no hay posiciones, resetear flags y acumuladores
    if(buyCount == 0 && sellCount == 0)
    {
       onlyBuysMode = false;
@@ -636,6 +665,7 @@ void ManagePositions()
       return;
    }
    
+   // Verificar cooldown por falta de órdenes o expansiones en ambos lados
    bool triggerCooldown = false;
    string reason = "";
    
@@ -673,6 +703,7 @@ void ManagePositions()
    double adjustedProfitTarget = InpProfitTarget + closedLossAccumulator + totalCommissions;
    double adjustedOneDirectionTarget = InpOneDirectionProfitTarget + closedLossAccumulator + totalCommissions;
    
+   // --- Caso: ambas direcciones abiertas ---
    if(buyCount > 0 && sellCount > 0)
    {
       onlyBuysMode = false;
@@ -692,6 +723,7 @@ void ManagePositions()
       return;
    }
    
+   // --- Caso: solo compras ---
    if(isOnlyBuys)
    {
       if(!onlyBuysMode)
@@ -738,6 +770,7 @@ void ManagePositions()
       }
    }
    
+   // --- Caso: solo ventas ---
    if(isOnlySells)
    {
       if(!onlySellsMode)
@@ -918,7 +951,6 @@ void CheckAndAddOrders()
    if(dailyDrawdownReached || dailyProfitReached || cooldownActive)
       return;
    
-   // Si no está permitido operar, no añadir órdenes
    if(!IsTradingAllowed())
       return;
    
@@ -1457,15 +1489,15 @@ void UpdateMaxDrawdown()
 }
 
 //+------------------------------------------------------------------+
-//| FUNCIONES DEL PANEL VISUAL (sin cambios, solo se actualiza)     |
+//| FUNCIONES DEL PANEL VISUAL                                        |
 //+------------------------------------------------------------------+
 void CreatePanel(int panelX, int panelY, int panelWidth, int panelHeight)
 {
    ObjectsDeleteAll(0, "GridPanel_");
    
    int rowHeight = MathMax(InpFontSizeLabels + 8, 28);
-   int totalRows = 7;
-   int calculatedHeight = (totalRows * rowHeight) + 45;
+   int totalRows = 9; // 9 filas
+   int calculatedHeight = (totalRows * rowHeight) + 55;
    panelHeight = MathMax(panelHeight, calculatedHeight);
    
    ObjectCreate(0, "GridPanel_Background", OBJ_RECTANGLE_LABEL, 0, 0, 0);
@@ -1485,7 +1517,7 @@ void CreatePanel(int panelX, int panelY, int panelWidth, int panelHeight)
    int labelX = panelX + 10;
    int valueX = labelX + InpPanelSeparation;
    
-   CreateLabel("GridPanel_Title", labelX, yPos, "=== EA Grid Trading v1.95 ===", InpColorTitle, InpFontSizeTitle);
+   CreateLabel("GridPanel_Title", labelX, yPos, "=== EA Grid Trading v1.98 ===", InpColorTitle, InpFontSizeTitle);
    yPos += rowHeight;
    CreateLabel("GridPanel_ProfitLabel", labelX, yPos, "Profit actual:", InpColorLabels, InpFontSizeLabels);
    CreateLabel("GridPanel_ProfitValue", valueX, yPos, "0.00", InpColorValues, InpFontSizeValues);
@@ -1504,8 +1536,17 @@ void CreatePanel(int panelX, int panelY, int panelWidth, int panelHeight)
    yPos += rowHeight;
    CreateLabel("GridPanel_ProfitDailyLabel", labelX, yPos, "Falta profit diario:", InpColorLabels, InpFontSizeLabels);
    CreateLabel("GridPanel_ProfitDailyValue", valueX, yPos, "---", InpColorValues, InpFontSizeValues);
+   yPos += rowHeight;
+   CreateLabel("GridPanel_LimitsLabel", labelX, yPos, "Límites alcanzados:", InpColorLabels, InpFontSizeLabels);
+   string limitsText = "Profits: 0 | Drawdowns: 0";
+   CreateLabel("GridPanel_LimitsValue", valueX, yPos, limitsText, InpColorValues, InpFontSizeValues);
+   yPos += rowHeight;
+   // Nueva línea: Profit de cierre por límite de posiciones
+   CreateLabel("GridPanel_CloseLimitLabel", labelX, yPos, "Profit cierre por límite:", InpColorLabels, InpFontSizeLabels);
+   CreateLabel("GridPanel_CloseLimitValue", valueX, yPos, "---", InpColorValues, InpFontSizeValues);
    yPos += rowHeight + 5;
    
+   // Botón Trailing
    string btnName = "GridPanel_TrailingBtn";
    ObjectCreate(0, btnName, OBJ_BUTTON, 0, 0, 0);
    ObjectSetInteger(0, btnName, OBJPROP_XDISTANCE, labelX);
@@ -1618,6 +1659,27 @@ void UpdatePanel()
       ObjectSetInteger(0, "GridPanel_ProfitDailyValue", OBJPROP_COLOR, clrGold);
    else
       ObjectSetInteger(0, "GridPanel_ProfitDailyValue", OBJPROP_COLOR, clrGray);
+   
+   // Contadores de límites alcanzados
+   string limitsText = "Profits: " + IntegerToString(dailyProfitCount) + " | Drawdowns: " + IntegerToString(dailyDrawdownCount);
+   ObjectSetString(0, "GridPanel_LimitsValue", OBJPROP_TEXT, limitsText);
+   if(dailyProfitCount > 0 || dailyDrawdownCount > 0)
+      ObjectSetInteger(0, "GridPanel_LimitsValue", OBJPROP_COLOR, clrGold);
+   else
+      ObjectSetInteger(0, "GridPanel_LimitsValue", OBJPROP_COLOR, clrGray);
+   
+   // Profit de cierre por límite de posiciones
+   string closeLimitText = (lastMaxPositionsProfit != 0.0) ? DoubleToString(lastMaxPositionsProfit, 2) : "---";
+   ObjectSetString(0, "GridPanel_CloseLimitValue", OBJPROP_TEXT, closeLimitText);
+   if(lastMaxPositionsProfit != 0.0)
+   {
+      if(lastMaxPositionsProfit > 0)
+         ObjectSetInteger(0, "GridPanel_CloseLimitValue", OBJPROP_COLOR, clrGold);
+      else
+         ObjectSetInteger(0, "GridPanel_CloseLimitValue", OBJPROP_COLOR, clrRed);
+   }
+   else
+      ObjectSetInteger(0, "GridPanel_CloseLimitValue", OBJPROP_COLOR, clrGray);
    
    if(InpTrailingStopPoints > 0)
    {
